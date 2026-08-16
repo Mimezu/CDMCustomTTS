@@ -180,6 +180,11 @@ local function CreateEditorExtension(editor)
 	textLabel:SetText("Custom spoken text")
 	textLabel:SetTextColor(unpack(COLORS.accent))
 
+	local creator = pane:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+	creator:SetPoint("TOPRIGHT", 0, -2)
+	creator:SetText("by Mimezu")
+	creator:SetTextColor(unpack(COLORS.muted))
+
 	local text = CreateFrame("EditBox", nil, pane, "BackdropTemplate")
 	text:SetSize(268, 20)
 	text:SetPoint("TOPLEFT", textLabel, "BOTTOMLEFT", 0, -5)

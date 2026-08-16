@@ -1,7 +1,8 @@
 # CDM Custom TTS
 
-CDM Custom TTS extends World of Warcraft's native Cooldown Manager alert editor
-with short, custom text-to-speech phrases and voice selection.
+CDM Custom TTS is a World of Warcraft addon by **Mimezu** that extends the
+native Cooldown Manager alert editor with short, custom text-to-speech phrases
+and voice selection.
 
 It stays inside Blizzard's existing alert workflow: select **Text to Speech** as
 the sound alert, enter the phrase you want to hear, choose a voice, and apply the

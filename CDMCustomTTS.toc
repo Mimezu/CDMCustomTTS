@@ -1,8 +1,8 @@
-## Interface: 120000, 120001, 120005
+## Interface: 120100
 ## Title: CDM Custom TTS
 ## Notes: Custom spoken text for Blizzard Cooldown Manager TTS alerts.
 ## Author: Mimezu
-## Version: 0.2.1
+## Version: 0.2.2
 ## SavedVariables: CDMCustomTTSDB
 
 CDMCustomTTS.lua
