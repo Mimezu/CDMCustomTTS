@@ -1,0 +1,67 @@
+name: Publish addon release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "CDMCustomTTS.toc"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect a daily big-push version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(sed -n 's/^## Version: //p' "CDMCustomTTS.toc" | head -n 1)"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.0$ ]]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION is a normal patch build; no public release."
+            exit 0
+          fi
+
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "number=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build install-ready ZIP
+        if: steps.version.outputs.release == 'true'
+        shell: bash
+        run: |
+          mkdir -p "CDMCustomTTS"
+          rsync -a \
+            --exclude=".git" \
+            --exclude=".github" \
+            --exclude="*.zip" \
+            --exclude=".DS_Store" \
+            ./ "CDMCustomTTS/"
+          zip -qr "CDMCustomTTS.zip" "CDMCustomTTS"
+
+      - name: Publish GitHub Release
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.number }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; keeping it unchanged."
+            exit 0
+          fi
+
+          gh release create "$TAG" "CDMCustomTTS.zip" \
+            --target "$GITHUB_SHA" \
+            --title "CDMCustomTTS $VERSION" \
+            --generate-notes
