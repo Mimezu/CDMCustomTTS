@@ -39,14 +39,18 @@ jobs:
         if: steps.version.outputs.release == 'true'
         shell: bash
         run: |
-          mkdir -p "CDMCustomTTS"
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/CDMCustomTTS"
           rsync -a \
             --exclude=".git" \
             --exclude=".github" \
             --exclude="*.zip" \
             --exclude=".DS_Store" \
-            ./ "CDMCustomTTS/"
-          zip -qr "CDMCustomTTS.zip" "CDMCustomTTS"
+            ./ "$STAGE/CDMCustomTTS/"
+          (
+            cd "$STAGE"
+            zip -qr "$GITHUB_WORKSPACE/CDMCustomTTS.zip" "CDMCustomTTS"
+          )
 
       - name: Publish GitHub Release
         if: steps.version.outputs.release == 'true'
