@@ -2,7 +2,7 @@
 ## Title: CDM Custom TTS
 ## Notes: Custom spoken text for Blizzard Cooldown Manager TTS alerts.
 ## Author: Mimezu
-## Version: 0.2.2
+## Version: 0.4.0
 ## SavedVariables: CDMCustomTTSDB
 
 CDMCustomTTS.lua

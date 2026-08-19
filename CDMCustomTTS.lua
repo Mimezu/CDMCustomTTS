@@ -3,10 +3,22 @@ local addonName = ...
 local addon = CreateFrame("Frame")
 local db
 local installed = false
+local lastSpokenAt = {}
+local pendingSpeech = {}
+local pendingSpeechKeys = {}
+local speechFlushScheduled = false
+local suppressionGeneration = 0
+local suppressionActive = false
+local delayedSpeechTimers = {}
 
 local SOUND_ALERT = Enum.CooldownViewerAlertType.Sound
 local TTS_PAYLOAD = Enum.CooldownViewerSound.TextToSpeech
+local AURA_APPLIED_EVENT = Enum.CooldownViewerAlertEventType.OnAuraApplied
+local AURA_REMOVED_EVENT = Enum.CooldownViewerAlertEventType.OnAuraRemoved
 local DEFAULT_VOICE_TEXT = DEFAULT or "Default"
+local REPEAT_GUARD_SECONDS = 0.75
+local TTS_STOP_SETTLE_SECONDS = 0.075
+local MAX_DELAY_SECONDS = 300
 
 -- Match the shared Resonance / PriorityFader visual language, but keep the
 -- palette local so this addon has no dependency on either project.
@@ -71,6 +83,10 @@ local function RuleKey(cooldownID, eventType)
 	return tostring(cooldownID) .. ":" .. tostring(eventType)
 end
 
+local function IsAuraEvent(eventType)
+	return eventType == AURA_APPLIED_EVENT or eventType == AURA_REMOVED_EVENT
+end
+
 local function GetRule(cooldownID, eventType)
 	return db and db.rules[RuleKey(cooldownID, eventType)]
 end
@@ -94,6 +110,131 @@ local function Speak(rule)
 	-- Retail 12.x: voiceID, text, rate, volume, allowOverlappedSpeech.
 	pcall(C_VoiceChat.SpeakText, rule.voiceID or 0, rule.text, 0, volume, true)
 	return true
+end
+
+local function FlushPendingSpeech()
+	speechFlushScheduled = false
+	if suppressionActive then
+		return
+	end
+
+	local speech = pendingSpeech
+	pendingSpeech = {}
+	pendingSpeechKeys = {}
+
+	for _, rule in ipairs(speech) do
+		Speak(rule)
+	end
+end
+
+local function ScheduleSpeechFlush()
+	if suppressionActive or speechFlushScheduled then
+		return
+	end
+	speechFlushScheduled = true
+	C_Timer.After(0, FlushPendingSpeech)
+end
+
+local function QueueCustomSpeech(key, rule)
+	if pendingSpeechKeys[key] then
+		return
+	end
+
+	pendingSpeechKeys[key] = true
+	pendingSpeech[#pendingSpeech + 1] = {
+		text = rule.text,
+		voiceID = rule.voiceID or 0,
+	}
+	ScheduleSpeechFlush()
+end
+
+local function StopNativeSpeech()
+	if C_VoiceChat and C_VoiceChat.StopSpeakingText then
+		C_VoiceChat.StopSpeakingText()
+	end
+end
+
+local function BeginNativeSpeechSuppression()
+	-- StopSpeakingText and SpeakText are handled asynchronously by the Windows
+	-- speech engine. Speaking the replacement in the same callback can race the
+	-- stop request, allowing the native full-name utterance through. Two bounded
+	-- stop passes create a stable handoff before any queued custom line is spoken.
+	suppressionGeneration = suppressionGeneration + 1
+	local generation = suppressionGeneration
+	suppressionActive = true
+
+	C_Timer.After(0, function()
+		if generation ~= suppressionGeneration then
+			return
+		end
+		StopNativeSpeech()
+		C_Timer.After(TTS_STOP_SETTLE_SECONDS, function()
+			if generation ~= suppressionGeneration then
+				return
+			end
+			StopNativeSpeech()
+			C_Timer.After(TTS_STOP_SETTLE_SECONDS, function()
+				if generation ~= suppressionGeneration then
+					return
+				end
+				suppressionActive = false
+				FlushPendingSpeech()
+			end)
+		end)
+	end)
+end
+
+local function CancelDelayedSpeech(key)
+	local timer = delayedSpeechTimers[key]
+	if timer then
+		timer:Cancel()
+		delayedSpeechTimers[key] = nil
+	end
+end
+
+local function CancelAllDelayedSpeech()
+	for _, timer in pairs(delayedSpeechTimers) do
+		timer:Cancel()
+	end
+	delayedSpeechTimers = {}
+end
+
+local function ResetSpeechState()
+	CancelAllDelayedSpeech()
+	suppressionGeneration = suppressionGeneration + 1
+	suppressionActive = false
+	pendingSpeech = {}
+	pendingSpeechKeys = {}
+	speechFlushScheduled = false
+	lastSpokenAt = {}
+end
+
+local function QueueSpeechReplacement(key, rule)
+	local now = GetTime()
+	local previous = lastSpokenAt[key]
+	lastSpokenAt[key] = now
+
+	-- Always suppress the native full-name utterance. A duplicate native event
+	-- should not replace or restart an already scheduled custom warning.
+	BeginNativeSpeechSuppression()
+	if previous and now - previous < REPEAT_GUARD_SECONDS then
+		return
+	end
+
+	CancelDelayedSpeech(key)
+	local speech = {
+		text = rule.text,
+		voiceID = rule.voiceID or 0,
+	}
+	local delaySeconds = math.min(math.max(tonumber(rule.delaySeconds) or 0, 0), MAX_DELAY_SECONDS)
+	if delaySeconds > 0 then
+		delayedSpeechTimers[key] = C_Timer.NewTimer(delaySeconds, function()
+			delayedSpeechTimers[key] = nil
+			QueueCustomSpeech(key, speech)
+		end)
+	else
+		QueueCustomSpeech(key, speech)
+	end
 end
 
 local function GetVoiceOptions()
@@ -149,9 +290,11 @@ local function RefreshEditor(editor)
 		return
 	end
 
-	local show = IsTextToSpeechAlert(editor.workingCopyOfAlert)
+	local alert = editor.workingCopyOfAlert
+	local show = IsTextToSpeechAlert(alert)
+	local auraEvent = show and IsAuraEvent(CooldownViewerAlert_GetEvent(alert))
 	pane:SetShown(show)
-	editor:SetHeight(show and 495 or 385)
+	editor:SetHeight(show and (auraEvent and 535 or 495) or 385)
 	if not show then
 		editor._cdmCustomTTSAlertState = EditorAlertState(editor)
 		return
@@ -161,6 +304,10 @@ local function RefreshEditor(editor)
 	pane.text:SetText(rule and rule.text or "")
 	pane.voiceID = rule and rule.voiceID or 0
 	pane.voiceDropdown:UpdateText()
+	pane.delayLabel:SetShown(auraEvent)
+	pane.delay:SetShown(auraEvent)
+	pane.delaySuffix:SetShown(auraEvent)
+	pane.delay:SetText(auraEvent and tostring(rule and rule.delaySeconds or 0) or "0")
 	editor._cdmCustomTTSAlertState = EditorAlertState(editor)
 end
 
@@ -170,7 +317,7 @@ local function CreateEditorExtension(editor)
 	end
 
 	local pane = CreateFrame("Frame", nil, editor)
-	pane:SetSize(268, 94)
+	pane:SetSize(268, 134)
 	pane:SetPoint("TOPLEFT", editor.PayloadDropdown, "BOTTOMLEFT", 0, -24)
 	pane:Hide()
 	editor.CustomTTSPane = pane
@@ -237,6 +384,33 @@ local function CreateEditorExtension(editor)
 	preview:SetScript("OnClick", function()
 		Speak({ text = Trim(text:GetText()) ~= "" and Trim(text:GetText()) or "Text to speech preview", voiceID = pane.voiceID or 0 })
 	end)
+
+	local delayLabel = pane:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+	delayLabel:SetPoint("TOPLEFT", voiceDropdown, "BOTTOMLEFT", 0, -14)
+	delayLabel:SetText("Delay TTS")
+	delayLabel:SetTextColor(unpack(COLORS.accent))
+	pane.delayLabel = delayLabel
+
+	local delay = CreateFrame("EditBox", nil, pane, "BackdropTemplate")
+	delay:SetSize(42, 20)
+	delay:SetPoint("LEFT", delayLabel, "RIGHT", 8, 0)
+	delay:SetAutoFocus(false)
+	delay:SetNumeric(true)
+	delay:SetMaxLetters(3)
+	delay:SetFontObject("GameFontHighlight")
+	delay:SetJustifyH("CENTER")
+	delay:SetTextInsets(4, 4, 0, 0)
+	delay:SetText("0")
+	ApplyBackdrop(delay, COLORS.panel, COLORS.border)
+	delay:SetScript("OnEnterPressed", delay.ClearFocus)
+	delay:SetScript("OnEscapePressed", delay.ClearFocus)
+	pane.delay = delay
+
+	local delaySuffix = pane:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+	delaySuffix:SetPoint("LEFT", delay, "RIGHT", 7, 0)
+	delaySuffix:SetText("seconds after aura event")
+	delaySuffix:SetTextColor(unpack(COLORS.muted))
+	pane.delaySuffix = delaySuffix
 end
 
 local function SaveEditorRule(editor)
@@ -249,7 +423,18 @@ local function SaveEditorRule(editor)
 	if IsTextToSpeechAlert(alert) then
 		local text = Trim(editor.CustomTTSPane.text:GetText())
 		if text ~= "" then
-			db.rules[key] = { text = text, voiceID = editor.CustomTTSPane.voiceID or 0 }
+			local delaySeconds
+			if IsAuraEvent(CooldownViewerAlert_GetEvent(alert)) then
+				delaySeconds = math.min(tonumber(editor.CustomTTSPane.delay:GetText()) or 0, MAX_DELAY_SECONDS)
+				if delaySeconds <= 0 then
+					delaySeconds = nil
+				end
+			end
+			db.rules[key] = {
+				text = text,
+				voiceID = editor.CustomTTSPane.voiceID or 0,
+				delaySeconds = delaySeconds,
+			}
 			return
 		end
 	end
@@ -262,12 +447,12 @@ local function HookSaveButton(editor)
 	end
 	editor._cdmCustomTTSSaveHooked = true
 
-	-- Save before Blizzard applies the working alert and refreshes its item pool.
-	-- HookScript runs after that refresh on some client builds, which is too late.
-	local blizzardOnClick = editor:GetAddButton():GetScript("OnClick")
-	editor:GetAddButton():SetScript("OnClick", function(button, ...)
+	-- Do not replace Blizzard's handler or call AddCurrentAlert from addon code.
+	-- That would taint the native layout and cooldown item tables before combat.
+	-- A script hook runs only after Blizzard has applied and refreshed the alert;
+	-- the working copy is still available, so only our SavedVariables are touched.
+	editor:GetAddButton():HookScript("OnClick", function()
 		SaveEditorRule(editor)
-		return blizzardOnClick(button, ...)
 	end)
 end
 
@@ -278,19 +463,27 @@ local function Install()
 	installed = true
 
 	-- Never replace a Blizzard Cooldown Viewer function. Its combat update path
-	-- touches secret values, and an addon replacement taints that path. A secure
-	-- post-hook lets Blizzard finish its state transition first; we then replace
-	-- only the audible phrase for configured TTS alerts.
+	-- touches secret values, and an addon replacement taints that path. The secure
+	-- post-hook only captures non-secret alert identity; voice work is deferred
+	-- until the native combat update stack has unwound.
 	hooksecurefunc("CooldownViewerAlert_PlayAlert", function(cooldownItem, _, alert)
 		if not IsTextToSpeechAlert(alert) then
 			return
 		end
 
-		local rule = GetRule(cooldownItem:GetCooldownID(), CooldownViewerAlert_GetEvent(alert))
-		if rule and rule.text and C_VoiceChat and C_VoiceChat.StopSpeakingText then
-			C_VoiceChat.StopSpeakingText()
+		local cooldownID = cooldownItem:GetCooldownID()
+		local eventType = CooldownViewerAlert_GetEvent(alert)
+		if eventType == AURA_REMOVED_EVENT then
+			CancelDelayedSpeech(RuleKey(cooldownID, AURA_APPLIED_EVENT))
 		end
-		Speak(rule)
+
+		local key = RuleKey(cooldownID, eventType)
+		local rule = db and db.rules[key]
+		if not (rule and rule.text) then
+			return
+		end
+
+		QueueSpeechReplacement(key, rule)
 	end)
 
 	hooksecurefunc(CooldownViewerSettingsEditAlertMixin, "DisplayForAlert", function(editor)
@@ -337,15 +530,19 @@ local function Install()
 end
 
 addon:RegisterEvent("ADDON_LOADED")
-addon:SetScript("OnEvent", function(_, _, loadedName)
-	if loadedName == addonName then
+addon:RegisterEvent("PLAYER_DEAD")
+addon:RegisterEvent("PLAYER_ENTERING_WORLD")
+addon:SetScript("OnEvent", function(_, event, loadedName)
+	if event == "PLAYER_DEAD" or event == "PLAYER_ENTERING_WORLD" then
+		ResetSpeechState()
+	elseif event == "ADDON_LOADED" and loadedName == addonName then
 		CDMCustomTTSDB = CDMCustomTTSDB or {}
 		CDMCustomTTSDB.rules = CDMCustomTTSDB.rules or {}
 		db = CDMCustomTTSDB
 		if C_AddOns.IsAddOnLoaded("Blizzard_CooldownViewer") then
 			Install()
 		end
-	elseif loadedName == "Blizzard_CooldownViewer" then
+	elseif event == "ADDON_LOADED" and loadedName == "Blizzard_CooldownViewer" then
 		Install()
 	end
 end)
